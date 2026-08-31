@@ -1,0 +1,13 @@
+[Unit]
+Description=Mirror compositor DPMS state onto an LG webOS TV
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Environment=PATH=@BINDIR@:/usr/local/bin:/usr/bin
+ExecStart=@BINDIR@/lgtvc-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

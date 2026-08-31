@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""Minimal LG webOS TV power control (a Linux take on LGTV Companion).
+
+Stdlib only: WOL magic packets + the webOS SSAP websocket on port 3001 (TLS,
+self-signed) with 3000 (plain) as fallback.
+
+Config: ~/.config/lgtvc/config.json  {"ip": ..., "mac": ..., "key": ..., "hdmi": N}
+Override the path with LGTVC_CONFIG.
+
+Exit status: 0 done (or nothing to do), 1 failed. `off` and `screen-off`
+treat an unreachable TV as already off (exit 0); a pairing or protocol
+problem is always exit 1.
+"""
+import base64, json, os, re, socket, ssl, struct, sys, threading, time
+
+CONFIG = os.environ.get("LGTVC_CONFIG") or os.path.expanduser("~/.config/lgtvc/config.json")
+TIMEOUT_ON = 30       # seconds to keep trying to power on (Companion default)
+WOL_INTERVAL = 1.0    # Companion sends a magic packet every second while waiting
+CONNECT_TIMEOUT = 3.0 # per-port TCP connect timeout
+MAC_RE = re.compile(r"^([0-9a-fA-F]{2}[:\-.]?){5}[0-9a-fA-F]{2}$")
+
+# Unsigned manifest (LGTV Companion's "V3"). Recent webOS firmware rejects the
+# old signed com.lge.test manifest with "403 blacklisted certificate detected".
+MANIFEST = {"manifestVersion": 1, "permissions": ["LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "CLOSE", "TEST_OPEN", "TEST_PROTECTED", "CONTROL_AUDIO", "CONTROL_DISPLAY", "CONTROL_INPUT_JOYSTICK", "CONTROL_INPUT_MEDIA_RECORDING", "CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_TV", "CONTROL_POWER", "CONTROL_TV_SCREEN", "READ_APP_STATUS", "READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST", "READ_NETWORK_STATE", "READ_RUNNING_APPS", "READ_TV_CHANNEL_LIST", "WRITE_NOTIFICATION_TOAST", "READ_POWER_STATE", "READ_COUNTRY_INFO", "READ_SETTINGS", "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD", "WRITE_SETTINGS", "WRITE_NOTIFICATION_ALERT", "READ_INSTALLED_APPS", "READ_UPDATE_INFO"]}
+
+URI_POWER_STATE = "ssap://com.webos.service.tvpower/power/getPowerState"
+URI_SCREEN_ON = "ssap://com.webos.service.tvpower/power/turnOnScreen"
+URI_SCREEN_OFF = "ssap://com.webos.service.tvpower/power/turnOffScreen"
+URI_TURN_OFF = "ssap://system/turnOff"          # a toggle: powers ON from Active Standby
+URI_FOREGROUND = "ssap://com.webos.applicationManager/getForegroundAppInfo"
+URI_ALERT = "ssap://system.notifications/createAlert"
+LUNA_SETTINGS = "luna://com.webos.settingsservice/setSystemSettings"
+
+
+class ProtocolError(OSError):
+    """The TV answered, but said no: pairing needed, rejected, SSAP error."""
+
+
+class PairingNeeded(ProtocolError):
+    pass
+
+
+def log(msg):
+    print(f"lgtvc: {msg}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- websocket
+class WS:
+    """Just enough RFC 6455 to talk to webOS."""
+
+    def __init__(self, host, timeout=CONNECT_TIMEOUT):
+        self.sock = None
+        last = None
+        for port, tls in ((3001, True), (3000, False)):
+            try:
+                s = socket.create_connection((host, port), timeout=timeout)
+                if tls:
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    s = ctx.wrap_socket(s, server_hostname=host)
+                self._handshake(s, host, port)
+                self.sock = s
+                return
+            except OSError as e:
+                last = e
+        raise last
+
+    def _handshake(self, s, host, port):
+        key = base64.b64encode(os.urandom(16)).decode()
+        s.sendall((f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                   f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise OSError("connection closed during websocket handshake")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+            raise OSError("websocket upgrade refused: " + buf.split(b"\r\n", 1)[0].decode(errors="replace"))
+
+    def _recv_exact(self, n):
+        out = b""
+        while len(out) < n:
+            chunk = self.sock.recv(n - len(out))
+            if not chunk:
+                raise OSError("connection closed")
+            out += chunk
+        return out
+
+    def _send_frame(self, opcode, payload):
+        mask = os.urandom(4)
+        n = len(payload)
+        hdr = bytes([0x80 | opcode])
+        if n < 126:
+            hdr += bytes([0x80 | n])
+        elif n < 65536:
+            hdr += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            hdr += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(hdr + mask + masked)
+
+    def send(self, obj):
+        self._send_frame(0x1, json.dumps(obj).encode())
+
+    def recv(self, timeout):
+        """Return the next decoded JSON text message, or None on timeout."""
+        deadline = time.monotonic() + timeout
+        data = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self.sock.settimeout(remaining)
+            try:
+                b0, b1 = self._recv_exact(2)
+            except (socket.timeout, TimeoutError):
+                return None
+            fin, opcode = b0 & 0x80, b0 & 0x0F
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv_exact(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv_exact(8))[0]
+            mask = self._recv_exact(4) if b1 & 0x80 else None
+            payload = self._recv_exact(n)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:
+                raise OSError("server closed websocket")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode in (0x1, 0x0):
+                data += payload
+                if fin:
+                    try:
+                        return json.loads(data.decode())
+                    except ValueError:
+                        data = b""
+                        continue
+
+    def close(self):
+        try:
+            self._send_frame(0x8, b"")
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- webOS
+class TV:
+    def __init__(self, cfg, connect_timeout=CONNECT_TIMEOUT):
+        self.cfg = cfg
+        self.connect_timeout = connect_timeout
+        self.ws = None
+        self.seq = 0
+
+    def connect(self, pair_timeout=0):
+        """Connect + register. pair_timeout>0 waits for the on-screen prompt."""
+        self.ws = WS(self.cfg["ip"], self.connect_timeout)
+        payload = {"forcePairing": False, "pairingType": "PROMPT", "manifest": MANIFEST}
+        if self.cfg.get("key"):
+            payload["client-key"] = self.cfg["key"]
+        self.ws.send({"type": "register", "id": "register_0", "payload": payload})
+        deadline = time.monotonic() + max(5, pair_timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OSError("timed out waiting for pairing/registration")
+            msg = self.ws.recv(remaining)
+            if msg is None:
+                raise OSError("timed out waiting for pairing/registration")
+            t = msg.get("type")
+            if t == "registered":
+                key = msg.get("payload", {}).get("client-key")
+                if key and key != self.cfg.get("key"):
+                    self.cfg["key"] = key
+                    save_config(self.cfg)
+                    log("pairing accepted, client key saved")
+                return
+            if t == "error":
+                raise ProtocolError("registration rejected: " + str(msg.get("error")))
+            if t == "response" and msg.get("payload", {}).get("pairingType") == "PROMPT":
+                if pair_timeout <= 0:
+                    raise PairingNeeded("TV wants pairing: run `lgtvc pair` and accept the prompt on the TV")
+                log("accept the pairing prompt on the TV...")
+
+    def request(self, uri, payload=None, timeout=5):
+        self.seq += 1
+        rid = f"req_{self.seq}"
+        self.ws.send({"type": "request", "id": rid, "uri": uri, "payload": payload or {}})
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OSError(f"no response to {uri}")
+            msg = self.ws.recv(remaining)
+            if msg is None:
+                raise OSError(f"no response to {uri}")
+            if msg.get("id") != rid:
+                continue
+            body = msg.get("payload") or {}
+            if msg.get("type") == "error":
+                raise ProtocolError(f"{uri}: {msg.get('error')}")
+            if body.get("returnValue") is False:
+                raise ProtocolError(f"{uri}: {body.get('errorText') or body.get('errorCode') or body}")
+            return body
+
+    def power_state(self):
+        return self.request(URI_POWER_STATE)
+
+    def close(self):
+        if self.ws:
+            self.ws.close()
+            self.ws = None
+
+
+# ---------------------------------------------------------------- helpers
+def load_config():
+    try:
+        with open(CONFIG) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"lgtvc: no config at {CONFIG}; run: lgtvc setup <ip> <mac> [hdmi-input]")
+    except ValueError as e:
+        sys.exit(f"lgtvc: {CONFIG} is not valid JSON: {e}")
+    for key in ("ip", "mac"):
+        if not isinstance(cfg.get(key), str) or not cfg[key]:
+            sys.exit(f"lgtvc: {CONFIG} is missing {key!r}; run: lgtvc setup <ip> <mac> [hdmi-input]")
+    if not MAC_RE.match(cfg["mac"]):
+        sys.exit(f"lgtvc: {CONFIG} has a malformed MAC {cfg['mac']!r}")
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+
+
+def wol(cfg):
+    """Magic packet to broadcast and directly to the TV IP (Companion's AUTO)."""
+    mac = bytes.fromhex(re.sub(r"[:\-.]", "", cfg["mac"]))
+    pkt = b"\xff" * 6 + mac * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for target in ("255.255.255.255", cfg["ip"]):
+            try:
+                s.sendto(pkt, (target, 9))
+            except OSError as e:
+                log(f"WOL to {target} failed: {e}")
+
+
+def dropped(e):
+    """True if the TV hung up on us (worth one retry), as opposed to said no."""
+    if isinstance(e, ProtocolError):
+        return False
+    return isinstance(e, (ConnectionError, ssl.SSLEOFError, ssl.SSLZeroReturnError)) or "closed" in str(e)
+
+
+def connected(cfg, pair_timeout=0, attempts=2, connect_timeout=CONNECT_TIMEOUT):
+    """Connect + register. The TV sometimes drops the first socket right after
+    a power-state change, so retry once before giving up."""
+    for i in range(attempts):
+        tv = TV(cfg, connect_timeout)
+        try:
+            tv.connect(pair_timeout)
+            return tv
+        except OSError as e:
+            tv.close()
+            if i == attempts - 1 or not dropped(e):
+                raise
+            time.sleep(0.5)
+
+
+# ---------------------------------------------------------------- commands
+def cmd_setup(args):
+    if len(args) < 2:
+        sys.exit("usage: lgtvc setup <ip> <mac> [hdmi-input-number]")
+    ip, mac = args[0], args[1]
+    try:
+        socket.inet_aton(ip)
+    except OSError:
+        sys.exit(f"lgtvc: {ip!r} is not an IPv4 address")
+    if not MAC_RE.match(mac):
+        sys.exit(f"lgtvc: {mac!r} is not a MAC address (expected aa:bb:cc:dd:ee:ff)")
+    cfg = {"ip": ip, "mac": mac.lower()}
+    if len(args) > 2:
+        if not args[2].isdigit() or int(args[2]) < 1:
+            sys.exit(f"lgtvc: HDMI input must be a number from 1 up, got {args[2]!r}")
+        cfg["hdmi"] = int(args[2])
+    try:
+        cfg["key"] = load_config().get("key")   # keep an existing pairing
+    except SystemExit:
+        pass
+    cfg = {k: v for k, v in cfg.items() if v is not None}
+    save_config(cfg)
+    print(f"saved {CONFIG}; now run: lgtvc pair")
+    return 0
+
+
+def cmd_pair(cfg):
+    tv = connected(cfg, pair_timeout=60)
+    try:
+        # Same trick Companion uses right after pairing: a self-closing alert whose
+        # onclose action flips the TV's "Turn on via Wi-Fi/LAN" (WOL) setting on.
+        params = {"category": "network", "settings": {"wolwowlOnOff": "true"}}
+        tv.request(URI_ALERT, {"message": " ", "buttons": [{"label": "", "onClick": LUNA_SETTINGS, "params": params}],
+                               "onclose": {"uri": LUNA_SETTINGS, "params": params},
+                               "onfail": {"uri": LUNA_SETTINGS, "params": params}})
+        print("paired; state:", tv.power_state().get("state"))
+        return 0
+    finally:
+        tv.close()
+
+
+def cmd_state(cfg):
+    tv = connected(cfg)
+    try:
+        print(json.dumps(tv.power_state()))
+        return 0
+    finally:
+        tv.close()
+
+
+def cmd_screen_on(cfg):
+    tv = connected(cfg)
+    try:
+        tv.request(URI_SCREEN_ON)
+        log("screen unblanked")
+        return 0
+    finally:
+        tv.close()
+
+
+def cmd_on(cfg):
+    """Companion's POWER_ON: WOL every second; once reachable, get the TV to Active."""
+    start = time.monotonic()
+    stop = threading.Event()
+
+    def pump():   # magic packets at a steady 1 Hz, independent of connect timeouts
+        while not stop.is_set():
+            wol(cfg)
+            stop.wait(WOL_INTERVAL)
+
+    threading.Thread(target=pump, daemon=True).start()
+    toggled = False
+    try:
+        while time.monotonic() - start < TIMEOUT_ON:
+            try:
+                tv = connected(cfg, attempts=1, connect_timeout=1.5)
+            except ProtocolError as e:
+                log(str(e))
+                return 1
+            except OSError:
+                time.sleep(0.5)
+                continue
+            try:
+                st = tv.power_state()
+                state, processing = st.get("state"), st.get("processing")
+                if state == "Active" and not processing:
+                    log("TV is on")
+                    return 0
+                if state == "Screen Off":
+                    tv.request(URI_SCREEN_ON)
+                    log("screen unblanked")
+                    return 0
+                if state == "Active Standby" and not processing and not toggled:
+                    tv.request(URI_TURN_OFF)      # toggles the TV on
+                    toggled = True
+                    log("Active Standby, power toggled on")
+                time.sleep(1)
+            except ProtocolError as e:
+                log(str(e))
+                return 1
+            except OSError as e:
+                log(f"retrying: {e}")
+                time.sleep(1)
+            finally:
+                tv.close()
+        log("gave up powering on")
+        return 1
+    finally:
+        stop.set()
+
+
+def hdmi_ok(cfg, tv):
+    """Only act if the TV is showing our HDMI input (don't kill someone's Netflix)."""
+    want = cfg.get("hdmi")
+    if want is None:
+        return True
+    app = tv.request(URI_FOREGROUND).get("appId", "")
+    if app == f"com.webos.app.hdmi{want}":
+        return True
+    log(f"foreground app is {app or 'unknown'}, leaving TV alone")
+    return False
+
+
+def cmd_off(cfg, uri, label):
+    # `off` must work from a blanked panel too; `screen-off` only from Active.
+    actionable = ("Active", "Screen Off") if uri == URI_TURN_OFF else ("Active",)
+    try:
+        tv = connected(cfg)
+    except ProtocolError as e:
+        log(str(e))
+        return 1
+    except OSError as e:
+        log(f"not reachable ({e}); assuming already off")
+        return 0
+    try:
+        state = tv.power_state().get("state")
+        if state not in actionable:
+            log(f"state is {state!r}, nothing to do")
+            return 0
+        if not hdmi_ok(cfg, tv):
+            return 0
+        tv.request(uri)
+        log(label)
+        return 0
+    finally:
+        tv.close()
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        print("\ncommands: setup <ip> <mac> [hdmi] | pair | state | on | off | screen-on | screen-off | wol")
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "setup":
+        return cmd_setup(rest)
+    cfg = load_config()
+    if cmd == "pair":
+        return cmd_pair(cfg)
+    if cmd == "state":
+        return cmd_state(cfg)
+    if cmd == "wol":
+        wol(cfg)
+        return 0
+    if cmd == "on":
+        return cmd_on(cfg)
+    if cmd == "off":
+        return cmd_off(cfg, URI_TURN_OFF, "TV powered off (standby)")
+    if cmd == "screen-off":
+        return cmd_off(cfg, URI_SCREEN_OFF, "screen blanked (TV stays on)")
+    if cmd == "screen-on":
+        return cmd_screen_on(cfg)
+    sys.exit(f"lgtvc: unknown command {cmd!r}")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError) as e:
+        sys.exit(f"lgtvc: {e}")

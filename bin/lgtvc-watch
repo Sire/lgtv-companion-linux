@@ -1,0 +1,95 @@
+#!/bin/bash
+# lgtvc-watch: mirror the desktop's display-power (DPMS) state onto an LG TV.
+#
+# Idle daemons (Omarchy's shell, hypridle, swayidle, xss-lock, the DE's own
+# power manager, ...) turn the display off with DPMS. A webOS TV sees that only
+# as "no signal", drops to standby on its own timer, and a returning signal does
+# not wake it. This loop polls the display power state and keeps the TV in step:
+#   DPMS off: `lgtvc off`  (or `screen-off`)
+#   DPMS on:  `lgtvc on`   (Wake-on-LAN + SSAP)
+#
+# The TV is only considered in sync after the command succeeds. A failed
+# command is retried after LGTV_RETRY seconds for as long as the desktop
+# state still differs from the last state the TV was confirmed in.
+#
+# Backends (auto-detected, or force with LGTV_BACKEND):
+#   hyprland   hyprctl monitors -j   .dpmsStatus
+#   sway       swaymsg -t get_outputs .power      (also wlroots compositors
+#              that speak sway IPC)
+#   x11        xset q: "Monitor is On/Off/in Standby/in Suspend"
+#   custom     LGTV_QUERY_CMD: a command printing "true"/"false"
+#
+# Polling is used because none of these expose a DPMS *event*.
+#
+# Env:
+#   LGTV_MONITOR    output name (default: first output). hyprland/sway only.
+#   LGTV_OFF_CMD    off | screen-off            (default off = TV standby)
+#   LGTV_POLL       seconds between polls       (default 1)
+#   LGTV_RETRY      seconds before retrying a failed command (default 30)
+#   LGTV_BACKEND    hyprland | sway | x11 | custom
+#   LGTV_QUERY_CMD  custom backend command
+
+# Find lgtvc next to this script even when PATH lacks ~/.local/bin (systemd
+# user units on sessions that do not import the full environment).
+PATH="$(dirname "$(readlink -f "$0")"):$PATH"
+export PATH
+
+monitor="${LGTV_MONITOR:-}"
+off_cmd="${LGTV_OFF_CMD:-off}"
+poll="${LGTV_POLL:-1}"
+retry="${LGTV_RETRY:-30}"
+backend="${LGTV_BACKEND:-}"
+
+if ! command -v lgtvc >/dev/null; then
+  echo "lgtvc-watch: lgtvc not found on PATH" >&2
+  exit 1
+fi
+
+if [[ -z $backend ]]; then
+  if [[ -n $LGTV_QUERY_CMD ]]; then backend=custom
+  elif [[ -n $HYPRLAND_INSTANCE_SIGNATURE ]] && command -v hyprctl >/dev/null; then backend=hyprland
+  elif [[ -n $SWAYSOCK ]] && command -v swaymsg >/dev/null; then backend=sway
+  elif [[ -n $DISPLAY ]] && command -v xset >/dev/null; then backend=x11
+  fi
+fi
+
+case $backend in
+hyprland) query() { hyprctl monitors -j 2>/dev/null | jq -r --arg m "$monitor" '[.[] | select($m == "" or .name == $m)][0].dpmsStatus'; } ;;
+sway)     query() { swaymsg -t get_outputs 2>/dev/null | jq -r --arg m "$monitor" '[.[] | select($m == "" or .name == $m)][0].power'; } ;;
+x11)      query() { case "$(xset q 2>/dev/null | grep -o 'Monitor is .*')" in *On) echo true ;; *Off | *Standby | *Suspend) echo false ;; esac; } ;;
+custom)   query() { bash -c "$LGTV_QUERY_CMD" 2>/dev/null; } ;;
+*)
+  echo "lgtvc-watch: no supported display backend found (Hyprland, sway, X11). Set LGTV_BACKEND or LGTV_QUERY_CMD." >&2
+  exit 1
+  ;;
+esac
+
+# One instance per session.
+lockfile="${XDG_RUNTIME_DIR:-/tmp}/lgtvc-watch.lock"
+if ! exec {lock}>"$lockfile"; then
+  echo "lgtvc-watch: cannot open lock file $lockfile" >&2
+  exit 1
+fi
+if ! flock -n "$lock"; then
+  echo "lgtvc-watch: already running (lock held on $lockfile)" >&2
+  exit 0
+fi
+
+echo "lgtvc-watch: backend=$backend monitor=${monitor:-first} off=$off_cmd poll=${poll}s" >&2
+
+applied=""      # last state the TV was successfully put in
+next_try=0      # epoch seconds before which a failed command is not retried
+while :; do
+  cur=$(query)
+  if [[ $cur == true || $cur == false ]] && [[ $cur != "$applied" ]] && (( $(printf '%(%s)T' -1) >= next_try )); then
+    if [[ -z $applied ]]; then
+      applied=$cur   # first sample: assume the TV already matches
+    elif { [[ $cur == true ]] && lgtvc on; } || { [[ $cur == false ]] && lgtvc "$off_cmd"; }; then
+      applied=$cur
+    else
+      echo "lgtvc-watch: command failed, retrying in ${retry}s" >&2
+      next_try=$(( $(printf '%(%s)T' -1) + retry ))
+    fi
+  fi
+  sleep "$poll"
+done

@@ -1,0 +1,17 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax + help
+        run: |
+          python3 -m py_compile bin/lgtvc
+          python3 bin/lgtvc --help
+      - name: Bash syntax
+        run: bash -n bin/lgtvc-watch install.sh
+      - name: shellcheck
+        run: |
+          sudo apt-get install -y -q shellcheck >/dev/null
+          shellcheck -S warning bin/lgtvc-watch install.sh
