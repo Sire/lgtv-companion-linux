@@ -11,7 +11,7 @@ Exit status: 0 done (or nothing to do), 1 failed. `off` and `screen-off`
 treat an unreachable TV as already off (exit 0); a pairing or protocol
 problem is always exit 1.
 """
-import base64, json, os, re, socket, ssl, struct, sys, threading, time
+import base64, fcntl, ipaddress, json, os, re, socket, ssl, struct, sys, threading, time
 
 CONFIG = os.environ.get("LGTVC_CONFIG") or os.path.expanduser("~/.config/lgtvc/config.json")
 TIMEOUT_ON = 30       # seconds to keep trying to power on (Companion default)
@@ -244,13 +244,37 @@ def save_config(cfg):
     os.replace(tmp, CONFIG)
 
 
+def subnet_broadcasts(ip):
+    """Directed broadcast address of each local IPv4 subnet that holds ip.
+
+    255.255.255.255 leaves through the default route only, so a TV on another
+    interface (a direct cable, a second NIC) never sees it, and the unicast copy
+    needs an ARP reply a sleeping TV does not give. The subnet's own broadcast
+    is routed out the interface the TV is on.
+    """
+    target = ipaddress.ip_address(ip)
+    found = []
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        for _, name in socket.if_nameindex():
+            req = struct.pack("256s", name.encode()[:15])
+            try:
+                addr = socket.inet_ntoa(fcntl.ioctl(s, 0x8915, req)[20:24])  # SIOCGIFADDR
+                mask = socket.inet_ntoa(fcntl.ioctl(s, 0x891B, req)[20:24])  # SIOCGIFNETMASK
+            except OSError:
+                continue  # no IPv4 address on this interface
+            net = ipaddress.ip_network(f"{addr}/{mask}", strict=False)
+            if target in net and net.prefixlen < 31:
+                found.append(str(net.broadcast_address))
+    return found
+
+
 def wol(cfg):
-    """Magic packet to broadcast and directly to the TV IP (Companion's AUTO)."""
+    """Magic packet to broadcast, the TV's subnet broadcast and the TV IP."""
     mac = bytes.fromhex(re.sub(r"[:\-.]", "", cfg["mac"]))
     pkt = b"\xff" * 6 + mac * 16
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        for target in ("255.255.255.255", cfg["ip"]):
+        for target in ("255.255.255.255", *subnet_broadcasts(cfg["ip"]), cfg["ip"]):
             try:
                 s.sendto(pkt, (target, 9))
             except OSError as e:
