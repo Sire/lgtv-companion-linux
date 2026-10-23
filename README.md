@@ -36,13 +36,15 @@ reliable channel is the network.
 | | |
 |---|---|
 | `bin/lgtvc` | The TV client. Python 3, standard library only, with its own small websocket implementation. No pip packages. |
-| `bin/lgtvc-watch` | Polls the desktop's display-power state and runs `lgtvc on` / `lgtvc off` in step. Backends: Hyprland, sway, X11, or a custom command. |
+| `bin/lgtvc-watch` | Polls the desktop's display-power state and runs `lgtvc on` / `lgtvc off` in step, and follows suspend and resume through logind. Backends: Hyprland, sway, X11, or a custom command. |
 | `lgtvc-watch.service` | systemd user unit for the watcher. |
 | `install.sh` | Symlinks both into `~/.local/bin`. `--service` installs and enables the unit. |
 
 ## Requirements
 
 - Python 3.8 or newer, `bash`, `jq` (for the Hyprland and sway backends).
+- For the suspend hook: logind, `systemd-inhibit`, and `gdbus` (glib2) or
+  `dbus-monitor`. Missing, the watcher says so in its log and mirrors DPMS only.
 - PC and TV on the same layer-2 network, since WOL is a broadcast. Give the
   TV a fixed IP or a DHCP reservation.
 - A wired TV if possible. WOL over Wi-Fi works on some models and firmwares
@@ -104,6 +106,53 @@ The watcher needs the compositor's environment (`HYPRLAND_INSTANCE_SIGNATURE`,
 `SWAYSOCK`, or `DISPLAY`). Most sessions import it into the systemd user
 manager. If yours does not, launch the watcher from the compositor instead.
 
+### Suspend and resume
+
+Besides the display state, the watcher follows the machine's own sleep through
+logind's `PrepareForSleep` signal:
+
+- Going down: `lgtvc off`, skipped when the TV is already off. A delay
+  inhibitor holds the suspend until the command returns, capped by
+  `LGTV_SLEEP_TIMEOUT`. A reachable TV answers in about 0.3 s.
+- Coming back: wait for a default route, then apply the current display state
+  even when the TV is believed to be in it already.
+
+The second half is the reason this exists. A machine suspended from a lit
+screen comes back with the display still lit, so there is no DPMS transition to
+poll for, while the TV has been in standby since the HDMI signal went away.
+Polling alone sees no change and concludes it is in sync, and you reach for the
+remote.
+
+Between the two signals nothing is mirrored. The display can still answer "on"
+long after the TV was told to stand by, and acting on that would wake the TV a
+second before the machine suspends.
+
+Shutdown and reboot are not handled. They tear the session down, and the TV
+falls back to its own no-signal timer.
+
+### Not every blank is bedtime
+
+Mirroring the display state one to one works on a monitor and misbehaves on a
+TV, where every transition costs a standby cycle and several seconds of
+Wake-on-LAN. Two rules keep that in check.
+
+A blank has to last `LGTV_OFF_DELAY` (60 s) before the TV is told to stand by.
+Omarchy's lock screen blanks five seconds after the last keypress, so without
+the delay the TV goes to standby, gets woken, and is dark again before you have
+finished typing your password. Short blanks now never reach it. Set it to `0`
+for the old behavior.
+
+The TV is only woken while the user is there. When a TV powers off it drops the
+HDMI link, the compositor loses the output, and the output that comes back a
+second later reads as lit. Treating that as a wake had the TV switching itself
+on in the middle of the night, the lock screen blanking it again five seconds
+later, and round it went until the set stopped answering Wake-on-LAN at all.
+The compositor's idle monitor is what tells a returning output from somebody
+pressing a key. On Omarchy that source is found automatically; elsewhere set
+`LGTV_ACTIVITY_CMD` to a command that prints `true` while the user is present.
+With no source, every lit display counts as a wake, which is what it did
+before.
+
 ### Settings
 
 | Env | Meaning | Default |
@@ -111,8 +160,35 @@ manager. If yours does not, launch the watcher from the compositor instead.
 | `LGTV_OFF_CMD` | `off` (TV standby) or `screen-off` (blank panel, TV stays on) | `off` |
 | `LGTV_MONITOR` | Output to watch (Hyprland and sway) | first output |
 | `LGTV_POLL` | Poll interval in seconds | `1` |
+| `LGTV_RETRY` | Seconds before retrying a failed command, doubling on each further failure | `30` |
+| `LGTV_RETRY_MAX` | Ceiling for that wait | `300` |
+| `LGTV_OFF_DELAY` | Seconds the display must stay dark before the TV is put into standby | `60` |
+| `LGTV_ACTIVITY_CMD` | Command printing `true` while the user is present | omarchy-shell, if installed |
 | `LGTV_BACKEND` | `hyprland`, `sway`, `x11`, or `custom` | auto |
 | `LGTV_QUERY_CMD` | For `custom`: a command that prints `true` or `false` | none |
+| `LGTV_SLEEP` | `1` follows suspend and resume, `0` is DPMS only | `1` |
+| `LGTV_SLEEP_TIMEOUT` | Seconds the off before suspend may take | `5` |
+| `LGTV_RESUME_WAIT` | Seconds to wait for a default route after resume before waking the TV anyway | `30` |
+| `LGTV_SLEEP_MONITOR` | Command printing logind sleep events, for tests | `gdbus`, else `dbus-monitor` |
+
+### Turning the sleep hook back off
+
+`LGTV_SLEEP=0` leaves the plain DPMS mirror, with no inhibitor and no D-Bus
+client. Per run:
+
+```bash
+LGTV_SLEEP=0 lgtvc-watch
+```
+
+For a session-wide setting, put it where the session manager will import it,
+then restart the watcher:
+
+```bash
+echo LGTV_SLEEP=0 > ~/.config/environment.d/lgtvc.conf
+```
+
+To drop the feature entirely, revert the commit that added it: `bin/lgtvc-watch`
+is the only file with any of it.
 
 ## Command reference
 
@@ -165,7 +241,11 @@ If the TV wakes on the wrong input, set the HDMI input as the default in the
 TV. Launching `com.webos.app.hdmiN` the way LGTV Companion does is not
 implemented yet.
 
-To see what the watcher is doing, run it in a terminal: `LGTV_POLL=1 lgtvc-watch`.
+To see what the watcher is doing, read its log: `journalctl --user -t lgtvc-watch -f`.
+It routes stderr into the journal whenever stderr is not a terminal, because a
+session autostart usually hands it `/dev/null` and every diagnostic would be
+lost. Run it in a terminal (`lgtvc-watch`) and the lines come back to you
+instead.
 
 ## How this maps to LGTV Companion
 
@@ -175,6 +255,7 @@ To see what the watcher is doing, run it in a terminal: `LGTV_POLL=1 lgtvc-watch
 | `onWOL`: magic packet to broadcast and to the IP every second | `wol()` every second inside `cmd_on` |
 | `POWER_ON` state machine: `Active`, `Screen Off` to `turnOnScreen`, `Active Standby` to `turnOff` toggle | `cmd_on` |
 | `POWER_OFF` and `BLANK_SCREEN` with the foreground-app HDMI check | `cmd_off` and `hdmi_ok` |
+| System suspend and resume handling in the service | logind `PrepareForSleep` in `lgtvc-watch`, with a delay inhibitor |
 | Pairing with the unsigned "V3" manifest, client key persisted | `TV.connect`, `~/.config/lgtvc/config.json` |
 | `JSON_LUNA_SET_WOL` alert trick to enable WOL after pairing | `cmd_pair` |
 | boost.beast websocket, wss 3001 and ws 3000 | About 80 lines of RFC 6455 on `ssl` and `socket`, tries 3001 then 3000 |

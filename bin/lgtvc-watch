@@ -9,8 +9,35 @@
 #   DPMS on:  `lgtvc on`   (Wake-on-LAN + SSAP)
 #
 # The TV is only considered in sync after the command succeeds. A failed
-# command is retried after LGTV_RETRY seconds for as long as the desktop
-# state still differs from the last state the TV was confirmed in.
+# command is retried, with the wait doubling up to LGTV_RETRY_MAX for as long
+# as the desktop state still differs from the last state the TV was confirmed
+# in.
+#
+# Two things stop the mirror turning into a power cycle on a TV:
+#
+# A blank has to last LGTV_OFF_DELAY before the TV is told to stand by. A lock
+# screen that blanks seconds after every keypress (Omarchy's does, after five)
+# would otherwise put the TV through standby and Wake-on-LAN each time, and the
+# set needs seconds to come back, so it is dark again before you have typed
+# your password.
+#
+# The TV is only woken while the user is actually there. A display that reads
+# lit is not the same as somebody wanting it lit: when the TV powers off it
+# drops the HDMI link, the compositor loses the output, and the output that
+# comes back a second later is lit by default. Acting on that woke the TV in
+# the middle of the night, the lock screen blanked it again, and around it
+# went. The compositor's idle monitor is what tells the two apart.
+#
+# Suspend and resume are followed separately, through logind's PrepareForSleep
+# signal, because they need not produce a DPMS transition at all: a machine
+# suspended from a lit screen comes back with the display still lit, while the
+# TV has been in standby since the HDMI signal went away. Polling sees no
+# change and concludes it is in sync, so the signal drives it instead:
+#   sleeping  `lgtvc off`, with a delay inhibitor holding the suspend back
+#             until it returns (skipped when the TV is already off)
+#   resumed   wait for the network, then apply the current display state even
+#             when it matches the state the TV was last confirmed in
+# LGTV_SLEEP=0 leaves only the DPMS mirror.
 #
 # Backends (auto-detected, or force with LGTV_BACKEND):
 #   hyprland   hyprctl monitors -j   .dpmsStatus
@@ -25,9 +52,22 @@
 #   LGTV_MONITOR    output name (default: first output). hyprland/sway only.
 #   LGTV_OFF_CMD    off | screen-off            (default off = TV standby)
 #   LGTV_POLL       seconds between polls       (default 1)
-#   LGTV_RETRY      seconds before retrying a failed command (default 30)
+#   LGTV_RETRY      seconds before retrying a failed command, doubling on each
+#                   further failure (default 30)
+#   LGTV_RETRY_MAX  ceiling for that wait (default 300)
+#   LGTV_OFF_DELAY  seconds the display must stay dark before the TV is put
+#                   into standby (default 60). 0 mirrors every blank.
+#   LGTV_ACTIVITY_CMD  command printing "true" while the user is present.
+#                   Default: omarchy-shell's idle monitor when it is there.
+#                   No source at all means every lit display counts as a wake.
 #   LGTV_BACKEND    hyprland | sway | x11 | custom
 #   LGTV_QUERY_CMD  custom backend command
+#   LGTV_SLEEP      1 = follow logind suspend/resume, 0 = DPMS only (default 1)
+#   LGTV_SLEEP_TIMEOUT  seconds the off before suspend may take (default 5)
+#   LGTV_RESUME_WAIT    seconds to wait for a default route after resume
+#                       before waking the TV anyway (default 30)
+#   LGTV_SLEEP_MONITOR  command printing logind sleep events, for tests
+#                       (default: gdbus, or dbus-monitor when gdbus is missing)
 
 # Find lgtvc next to this script even when PATH lacks ~/.local/bin (systemd
 # user units on sessions that do not import the full environment).
@@ -38,10 +78,27 @@ monitor="${LGTV_MONITOR:-}"
 off_cmd="${LGTV_OFF_CMD:-off}"
 poll="${LGTV_POLL:-1}"
 retry="${LGTV_RETRY:-30}"
+retry_max="${LGTV_RETRY_MAX:-300}"
+off_delay="${LGTV_OFF_DELAY:-60}"
 backend="${LGTV_BACKEND:-}"
+sleep_hook="${LGTV_SLEEP:-1}"
+sleep_timeout="${LGTV_SLEEP_TIMEOUT:-5}"
+resume_wait="${LGTV_RESUME_WAIT:-30}"
+
+log() { echo "lgtvc-watch: $*" >&2; }
+now() { printf '%(%s)T' -1; }
+
+# uwsm-app (Omarchy's launch_on_start) hands the process /dev/null for stdout
+# and stderr, so every line below would be lost. Send stderr to the journal
+# when it is not a terminal; read it with `journalctl --user -t lgtvc-watch`.
+# Before the lock is taken, or systemd-cat inherits the lock fd and holds the
+# lock after this script is gone.
+if [[ ! -t 2 ]] && command -v systemd-cat >/dev/null; then
+  exec 2> >(exec systemd-cat -t lgtvc-watch)
+fi
 
 if ! command -v lgtvc >/dev/null; then
-  echo "lgtvc-watch: lgtvc not found on PATH" >&2
+  log "lgtvc not found on PATH"
   exit 1
 fi
 
@@ -59,37 +116,233 @@ sway)     query() { swaymsg -t get_outputs 2>/dev/null | jq -r --arg m "$monitor
 x11)      query() { case "$(xset q 2>/dev/null | grep -o 'Monitor is .*')" in *On) echo true ;; *Off | *Standby | *Suspend) echo false ;; esac; } ;;
 custom)   query() { bash -c "$LGTV_QUERY_CMD" 2>/dev/null; } ;;
 *)
-  echo "lgtvc-watch: no supported display backend found (Hyprland, sway, X11). Set LGTV_BACKEND or LGTV_QUERY_CMD." >&2
+  log "no supported display backend found (Hyprland, sway, X11). Set LGTV_BACKEND or LGTV_QUERY_CMD."
   exit 1
   ;;
 esac
 
+# Is the user there? Only consulted when the display reads lit and the TV is
+# believed to be off, which is both a genuine wake and an output that has just
+# come back from the TV powering itself off. Anything but an explicit "false"
+# counts as present, so a missing or broken source leaves the old behavior.
+activity_cmd="${LGTV_ACTIVITY_CMD:-}"
+if [[ -z $activity_cmd ]] && command -v omarchy-shell >/dev/null && command -v jq >/dev/null; then
+  activity_cmd='omarchy-shell idle status 2>/dev/null | jq -r "if .idle == true then \"false\" else \"true\" end"'
+fi
+
+user_present() {
+  [[ -n $activity_cmd ]] || return 0
+  [[ $(bash -c "$activity_cmd" 2>/dev/null) != false ]]
+}
+
 # One instance per session.
 lockfile="${XDG_RUNTIME_DIR:-/tmp}/lgtvc-watch.lock"
 if ! exec {lock}>"$lockfile"; then
-  echo "lgtvc-watch: cannot open lock file $lockfile" >&2
+  log "cannot open lock file $lockfile"
   exit 1
 fi
 if ! flock -n "$lock"; then
-  echo "lgtvc-watch: already running (lock held on $lockfile)" >&2
+  log "already running (lock held on $lockfile)"
   exit 0
 fi
 
-echo "lgtvc-watch: backend=$backend monitor=${monitor:-first} off=$off_cmd poll=${poll}s" >&2
+# ------------------------------------------------------------ sleep / resume
+# gdbus is a plain signal receiver. dbus-monitor needs a privilege it is not
+# given as a user and falls back to eavesdropping, which is deprecated and may
+# be off, so it is only the stand-in for a box without glib2.
+sleep_monitor=()
+if [[ -n ${LGTV_SLEEP_MONITOR:-} ]]; then
+  sleep_monitor=(bash -c "$LGTV_SLEEP_MONITOR")
+elif command -v gdbus >/dev/null; then
+  sleep_monitor=(gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1)
+elif command -v dbus-monitor >/dev/null; then
+  sleep_monitor=(dbus-monitor --system "type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'")
+fi
+
+events=          # fd the sleep events arrive on, empty while not listening
+events_pid=
+monitor_next=0   # epoch seconds before which a dead monitor is not restarted
+inhibit_fd=      # holds the delay inhibitor; closing it releases the suspend
+force=0          # apply the display state even if the TV is thought to match
+sleeping=0       # between the two PrepareForSleep signals
+sleeping_since=0
+
+start_monitor() {
+  [[ -n $events ]] && { exec {events}<&-; events=; }
+  # The lock fd would outlive this script in the child and keep the lock.
+  exec {events}< <(exec {lock}>&-; exec "${sleep_monitor[@]}" 2>/dev/null)
+  events_pid=$!
+  log "following logind sleep events (${sleep_monitor[0]##*/})"
+}
+
+# Held from now until the next PrepareForSleep, because logind only waits for
+# inhibitors that were already taken when it announced the suspend.
+inhibit_take() {
+  [[ -n $events && -z $inhibit_fd ]] || return 0
+  command -v systemd-inhibit >/dev/null || return 0
+  exec {inhibit_fd}> >(exec {lock}>&-; exec systemd-inhibit \
+    --what=sleep --mode=delay --who=lgtvc-watch --why="Put the TV into standby" \
+    cat >/dev/null 2>&1)
+}
+
+inhibit_release() {
+  [[ -n $inhibit_fd ]] || return 0
+  exec {inhibit_fd}>&-   # cat reads EOF, systemd-inhibit exits, logind proceeds
+  inhibit_fd=
+}
+
+on_sleep() {
+  sleeping=1
+  sleeping_since=$(now)
+  if [[ $applied == false ]]; then
+    log "suspending, TV already off"
+  else
+    log "suspending, TV to standby"
+    timeout "$sleep_timeout" lgtvc "$off_cmd" || log "$off_cmd before suspend failed"
+    applied=false   # it is going down one way or another: no signal, no TV
+  fi
+  inhibit_release
+}
+
+# WOL is a broadcast, so it needs a live interface. Right after resume the
+# link is usually still coming up and lgtvc would spend its whole 30 s window
+# talking to nothing.
+wait_for_net() {
+  local deadline
+  command -v ip >/dev/null || return 0
+  deadline=$(( $(now) + resume_wait ))
+  while [[ -z $(ip -4 route show default 2>/dev/null) ]]; do
+    if (( $(now) >= deadline )); then
+      log "no default route after ${resume_wait}s, going ahead anyway"
+      return 0
+    fi
+    sleep 1
+  done
+}
+
+on_resume() {
+  log "resumed"
+  sleeping=0
+  inhibit_take
+  wait_for_net
+  force=1       # the TV standbys itself on no signal; assume nothing
+  next_try=0
+}
+
+handle_event() {
+  case $1 in
+  # gdbus prints the arguments on the signal line, as
+  #   /org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep (true,)
+  # dbus-monitor puts them on the line after the member, and its match rule
+  # passes nothing else carrying a boolean, so a bare value is unambiguous.
+  *PrepareForSleep*true* | *'boolean true'*) on_sleep ;;
+  *PrepareForSleep*false* | *'boolean false'*) on_resume ;;
+  esac
+}
+
+# Sleep for $1 seconds, or until sleep events arrive and are handled.
+wait_events() {
+  local line rc
+  if [[ -z $events ]]; then
+    sleep "$1"
+    return
+  fi
+  while :; do
+    IFS= read -r -t "$1" -u "$events" line
+    rc=$?
+    if (( rc == 0 )); then
+      handle_event "$line"
+      continue
+    fi
+    (( rc > 128 )) && return   # timed out: the poll interval is up
+    log "sleep monitor exited, restarting in 30s"
+    exec {events}<&-
+    events=
+    monitor_next=$(( $(now) + 30 ))
+    sleep "$1"
+    return
+  done
+}
+
+trap 'inhibit_release; [[ -n $events_pid ]] && kill "$events_pid" 2>/dev/null; exit' TERM INT HUP
+
+if (( sleep_hook )) && (( ${#sleep_monitor[@]} )); then
+  start_monitor
+  inhibit_take
+elif (( sleep_hook )); then
+  log "no gdbus or dbus-monitor: suspend and resume are not followed"
+fi
+
+log "backend=$backend monitor=${monitor:-first} off=$off_cmd poll=${poll}s off-delay=${off_delay}s sleep=$sleep_hook activity=$([[ -n $activity_cmd ]] && echo yes || echo no)"
 
 applied=""      # last state the TV was successfully put in
-next_try=0      # epoch seconds before which a failed command is not retried
+last_seen=""    # last display reading, to spot a real change
+next_try=0      # epoch seconds before which no command is attempted
+fails=0         # consecutive failures, for the backoff
+off_since=0     # when the display went dark
+quiet=0         # a wake already skipped for an empty room (log it once)
 while :; do
+  # On the way down the display can still answer "on" long after the TV was
+  # told to standby, and mirroring that would wake it up again a second before
+  # the machine suspends. Nothing is mirrored until logind says we are back.
+  if (( sleeping )); then
+    if (( $(now) - sleeping_since > 120 )); then
+      # logind always follows one signal with the other, so this only catches
+      # a monitor that died in between. Without it the mirror stays frozen.
+      log "no resume signal within 120s, assuming the machine is awake"
+      on_resume
+    fi
+    wait_events "$poll"
+    continue
+  fi
+
   cur=$(query)
-  if [[ $cur == true || $cur == false ]] && [[ $cur != "$applied" ]] && (( $(printf '%(%s)T' -1) >= next_try )); then
-    if [[ -z $applied ]]; then
-      applied=$cur   # first sample: assume the TV already matches
-    elif { [[ $cur == true ]] && lgtvc on; } || { [[ $cur == false ]] && lgtvc "$off_cmd"; }; then
-      applied=$cur
-    else
-      echo "lgtvc-watch: command failed, retrying in ${retry}s" >&2
-      next_try=$(( $(printf '%(%s)T' -1) + retry ))
+  if [[ $cur == true || $cur == false ]]; then
+    # A real change is a fresh intent: drop any backoff and start the clock a
+    # blank has to run out before the TV is put to standby.
+    if [[ $cur != "$last_seen" ]]; then
+      last_seen=$cur
+      fails=0
+      next_try=0
+      quiet=0
+      [[ $cur == false ]] && off_since=$(now) || off_since=0
     fi
   fi
-  sleep "$poll"
+
+  if [[ $cur == true || $cur == false ]] && (( $(now) >= next_try )); then
+    # Resumed into a dark display: nothing to wake, and the TV is already off
+    # or on its way. Wait for a real DPMS change instead.
+    if (( force )) && [[ $cur == false ]]; then
+      applied=false
+      force=0
+    fi
+    if [[ $cur != "$applied" ]] || (( force )); then
+      if [[ -z $applied ]] && (( ! force )); then
+        applied=$cur   # first sample: assume the TV already matches
+      elif [[ $cur == false ]] && (( $(now) - off_since < off_delay )); then
+        :              # too short to be bedtime; the lock screen does this
+      elif [[ $cur == true ]] && ! user_present; then
+        (( quiet )) || log "display is lit but nobody is here, leaving the TV alone"
+        quiet=1
+        next_try=$(( $(now) + 2 ))   # cheap check, but not every poll
+      elif { [[ $cur == true ]] && lgtvc on; } || { [[ $cur == false ]] && lgtvc "$off_cmd"; }; then
+        applied=$cur
+        force=0
+        fails=0
+      else
+        (( fails++ ))
+        shift_by=$(( fails - 1 ))
+        (( shift_by > 8 )) && shift_by=8
+        backoff=$(( retry << shift_by ))
+        (( backoff > retry_max )) && backoff=$retry_max
+        log "command failed ($fails), retrying in ${backoff}s"
+        next_try=$(( $(now) + backoff ))
+      fi
+    fi
+  fi
+  if [[ -z $events ]] && (( sleep_hook )) && (( ${#sleep_monitor[@]} )) && (( $(now) >= monitor_next )); then
+    start_monitor
+    inhibit_take
+  fi
+  wait_events "$poll"
 done
